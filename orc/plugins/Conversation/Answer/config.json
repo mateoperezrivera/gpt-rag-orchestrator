@@ -24,6 +24,12 @@
           "required": true	
         },
         {
+          "name": "files",
+          "description": "Files input from the user to answer the user question (i.e., file1.pdf: To execute task A you need to access system B. file2.pdf: System B is used when users need to execute task A.)",
+          "defaultValue": "",
+          "required": true	
+        },
+        {
           "name": "conversation_summary",
           "description": "Conversation history summary.",
           "defaultValue": "",

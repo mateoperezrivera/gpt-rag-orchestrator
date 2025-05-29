@@ -13,6 +13,7 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     req_body = req.get_json()
     conversation_id = req_body.get('conversation_id')
     question = req_body.get('question')
+    files = req_body.get('files', [])  # Extract files array with data URIs
 
     # Get client principal information
     client_principal_id = req_body.get('client_principal_id', '00000000-0000-0000-0000-000000000000')
@@ -25,8 +26,8 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     }
 
     if question:
-
-        result = await orchestrator.run(conversation_id, question, client_principal)
+        # Pass the files array to the orchestrator
+        result = await orchestrator.run(conversation_id, question, client_principal, files)
 
         return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
     else:

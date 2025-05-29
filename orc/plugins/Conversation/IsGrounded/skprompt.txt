@@ -1,13 +1,14 @@
 ## Task Goal
-The task is to check if the ANSWER is based on the SOURCES.
+The task is to check if the ANSWER facts are based on the SOURCES and FILES.
 
 "SOURCES": "{{$sources}}"
+"FILES": "{{$files}}"
 
 ## Task Input:
 "ANSWER": "{{$answer}}"
 
 ## Task instructions
-- Is the ANSWER based on the input SOURCES?
+- Is the ANSWER facts based on facts included in the input SOURCES or the user FILES?
 - If the ANSWER is a follow-up question, asking for more clarification, answer yes.
 
 Output is yes or no lower case.

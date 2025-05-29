@@ -16,6 +16,7 @@ from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 from bs4 import BeautifulSoup
 import aiohttp
 from .ai_service_factory import create_service
+from markitdown import MarkItDown
 # logging level
 logging.getLogger('azure').setLevel(logging.WARNING)
 LOGLEVEL = os.environ.get('LOGLEVEL', 'DEBUG').upper()
@@ -465,3 +466,42 @@ def get_possitive_int_or_default(var, default_value):
     except:
         var = default_value
     return var
+
+
+def format_files_for_llm(processed_files):
+    """Format multiple file contents into a structured format for the LLM."""
+    if not processed_files or len(processed_files) == 0:
+        return ""
+    
+    formatted_text = "### USER PROVIDED FILES:\n\n"
+    
+    for i, file_content in enumerate(processed_files, 1):
+        # Add a clear separator with file number
+        formatted_text += f"--- FILE {i} ---\n"
+        
+        # Add the content with proper indentation for clarity
+        content_with_indentation = file_content.replace('\n', '\n  ')
+        formatted_text += f"  {content_with_indentation}\n\n"
+    
+    formatted_text += "--- END OF FILES ---\n\n"
+    return formatted_text.strip()
+
+# Add this function to validate and process files
+def process_files(files, markitdown:MarkItDown):
+    processed_files = []
+    if files:
+        for file_uri in files:
+            # Check if it's a valid data URI
+            logging.info(f"[code_orchest] processing file: {file_uri[:30]}...")
+            if isinstance(file_uri, str) and file_uri.startswith('data:'):
+                try:
+                    logging.info(f"[code_orchest] processing file: {file_uri[:30]}...")
+                    # Convert the data URI using markitdown
+                    processed_file = markitdown.convert_uri(file_uri)
+                    processed_files.append(processed_file.markdown)
+                except Exception as e:
+                    logging.error(f"[code_orchest] Error processing file URI: {e}")
+            else:
+                logging.warning(f"[code_orchest] Invalid data URI format: {file_uri[:30]}...")
+    logging.info(f"[code_orchest] processed files: {len(processed_files)}")
+    return processed_files

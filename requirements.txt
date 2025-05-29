@@ -17,4 +17,5 @@ beautifulsoup4==4.12.3
 pydantic==2.10.4
 nbstripout==0.8.1
 nbconvert==7.16.4
-azure-monitor-opentelemetry==1.6.4
+azure-monitor-opentelemetry==1.6.7
+markitdown[all]==0.1.1

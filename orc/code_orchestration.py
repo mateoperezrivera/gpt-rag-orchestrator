@@ -8,7 +8,7 @@ from orc.plugins.Conversation.Triage.wrapper import triage
 from orc.plugins.ResponsibleAI.wrapper import fairness
 from semantic_kernel.functions.kernel_arguments import KernelArguments
 from semantic_kernel.functions import KernelPlugin
-from shared.util import call_semantic_function, get_chat_history_as_messages, get_message, get_last_messages,get_possitive_int_or_default
+from shared.util import call_semantic_function, get_chat_history_as_messages, get_message, get_last_messages,get_possitive_int_or_default,process_files,format_files_for_llm
 from shared.util import get_blocked_list, create_kernel, get_usage_tokens, escape_xml_characters,get_secret
 import asyncio
 import xml.sax.saxutils as saxutils
@@ -16,6 +16,7 @@ from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.core.settings import settings 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.inference.aio import ChatCompletionsClient
+from markitdown import MarkItDown
 
 # logging level
 
@@ -62,7 +63,7 @@ if os.getenv('APPLICATION_INSIGHTS_CONNECTION_STRING') is not None:
     os.environ['AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED'] = 'true'       
     configure_azure_monitor(connection_string=os.getenv('APPLICATION_INSIGHTS_CONNECTION_STRING'))
 
-async def get_answer(history, security_ids,conversation_id,chainedTokenCredential):
+async def get_answer(history, security_ids,conversation_id,chainedTokenCredential,files):
 
     #############################
     # INITIALIZATION
@@ -99,8 +100,20 @@ async def get_answer(history, security_ids,conversation_id,chainedTokenCredentia
     # create kernel
     kernel,client = await create_kernel(credential=chainedTokenCredential,apim_key=apim_key)
     # create the arguments that will used by semantic functions
+    logging.info(f"Reading files")
+    try:
+        markitdown=MarkItDown()
+        files_text=process_files(files,markitdown)
+        if files_text:
+            files_text = format_files_for_llm(files_text)
+            logging.info(f"[code_orchest] files processed: {files_text[:50]}")
+    except Exception as e:
+        logging.error(f"[code_orchest] exception when processing files. {e}")
+        files_text = ""
+    
     async with client:
         arguments = KernelArguments()
+        arguments["files"] = files_text
         arguments["bot_description"] = bot_description
         arguments["ask"] = ask
         arguments["history"] = json.dumps(get_last_messages(messages, CONVERSATION_MAX_HISTORY), ensure_ascii=False)

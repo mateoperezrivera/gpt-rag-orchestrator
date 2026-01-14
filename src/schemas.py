@@ -1,5 +1,117 @@
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 from pydantic import BaseModel, Field
+
+# ----------------------------------------
+# Request/Response schemas for orchestrator operations
+# ----------------------------------------
+
+class ConversationMetadata(BaseModel):
+    """Metadata for a conversation in list view (no message content)."""
+    id: str = Field(
+        ...,
+        description="Unique identifier of the conversation",
+        example="8db90ba1-aa03-494e-a46e-efddf7cb4277"
+    )
+    name: Optional[str] = Field(
+        None,
+        description="User-provided name for the conversation",
+        example="Q3 Budget Discussion"
+    )
+    created_at: Optional[datetime] = Field(
+        None,
+        alias="_ts",
+        description="Timestamp when the conversation was created (Unix timestamp in seconds)",
+        example=1704718800
+    )
+    last_updated: Optional[datetime] = Field(
+        None,
+        alias="lastUpdated",
+        description="Timestamp when the last message was added",
+        example="2026-01-14T12:34:56.789Z"
+    )
+
+    class Config:
+        populate_by_name = True  # Allow both 'created_at' and '_ts'
+
+
+class ConversationListResponse(BaseModel):
+    """Response for GET /conversations list endpoint."""
+    conversations: List[ConversationMetadata] = Field(
+        default_factory=list,
+        description="List of conversations with metadata only"
+    )
+    has_more: bool = Field(
+        ...,
+        description="Whether there are more conversations available (more results than the limit)",
+        example=True
+    )
+    skip: int = Field(
+        ...,
+        description="Number of conversations skipped (pagination offset)",
+        example=0
+    )
+    limit: int = Field(
+        ...,
+        description="Maximum number of conversations returned",
+        example=10
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "conversations": [
+                    {
+                        "id": "8db90ba1-aa03-494e-a46e-efddf7cb4277",
+                        "name": "Q3 Budget Discussion",
+                        "created_at": 1704718800,
+                        "lastUpdated": "2026-01-14T12:34:56.789Z"
+                    }
+                ],
+                "has_more": True,
+                "skip": 0,
+                "limit": 10
+            }
+        }
+
+
+class ConversationDetail(BaseModel):
+    """Full conversation details including all messages."""
+    id: str = Field(
+        ...,
+        description="Unique identifier of the conversation",
+        example="8db90ba1-aa03-494e-a46e-efddf7cb4277"
+    )
+    name: Optional[str] = Field(
+        None,
+        description="User-provided name for the conversation",
+        example="Q3 Budget Discussion"
+    )
+    principal_id: Optional[str] = Field(
+        None,
+        description="User ID who owns this conversation",
+        example="3d18e02b-d957-4cc5-85e6-e595cd53eec6"
+    )
+    created_at: Optional[datetime] = Field(
+        None,
+        alias="_ts",
+        description="Timestamp when the conversation was created",
+        example=1704718800
+    )
+    last_updated: Optional[datetime] = Field(
+        None,
+        alias="lastUpdated",
+        description="Timestamp when the last message for the conversation was sent",
+        example="2026-01-14T12:34:56.789Z"
+    )
+    messages: Optional[List[Dict[str, Any]]] = Field(
+        default_factory=list,
+        description="List of messages in the conversation"
+    )
+
+    class Config:
+        populate_by_name = True
+
 
 class OrchestratorRequest(BaseModel):
     # Core ask/question fields

@@ -1,5 +1,6 @@
 import uuid
 import logging
+from datetime import datetime, timezone
 
 from typing import Dict, Optional
 from connectors.cosmosdb import CosmosDBClient
@@ -14,27 +15,18 @@ tracer = Telemetry.get_tracer(__name__)
 class Orchestrator:
     agentic_strategy = BaseAgentStrategy
 
-    def __init__(self, conversation_id: str):
-        # initializations
-
-        # conversation_id
+    def __init__(self, conversation_id: str, principal_id: str = None):
         self.conversation_id = conversation_id
-
-        # app configuration
+        self.principal_id = principal_id
         cfg = get_config()
-        
-        # database
         self.database_client = CosmosDBClient()
         self.database_container = cfg.get("CONVERSATIONS_DATABASE_CONTAINER", "conversations")
         
     @classmethod
-    async def create(cls, conversation_id: str = None, user_context: Dict = {}):
-        instance = cls(conversation_id=conversation_id)
-
-        # app configuration
+    async def create(cls, conversation_id: str = None, principal_id: str = None, user_context: Dict = {}):
+        instance = cls(conversation_id=conversation_id, principal_id=principal_id)
         cfg = get_config()
 
-        # agentic strategy
         agentic_strategy_name = cfg.get("AGENT_STRATEGY", "single_agent_rag")
         instance.agentic_strategy = await AgentStrategyFactory.get_strategy(agentic_strategy_name)
         if not instance.agentic_strategy:
@@ -54,10 +46,33 @@ class Orchestrator:
             # 1) Load or create our conversation document in Cosmos
             if not self.conversation_id:
                 self.conversation_id = str(uuid.uuid4())
-                conversation = {"id": self.conversation_id}
-                await self.database_client.create_document(self.database_container, self.conversation_id, conversation)
+                
+                # For anonymous users, use anonymous-{conversation_id} as partition key to avoid hot partitions
+                # For authenticated users, use their principal_id
+                partition_key = f"anonymous-{self.conversation_id}" if self.principal_id == "anonymous" else self.principal_id
+                
+                # Auto-generate conversation name from first 50 characters of the ask
+                default_name = ask[:50] if ask else "Untitled Conversation"
+                conversation = {
+                    "id": self.conversation_id,
+                    "name": default_name,
+                    "principal_id": partition_key,  # Store the partition key in the document
+                    "lastUpdated": datetime.now(timezone.utc).isoformat()
+                }
+                await self.database_client.create_document(
+                    self.database_container, 
+                    self.conversation_id, 
+                    conversation,
+                    partition_key=partition_key
+                )
             else:
-                conversation = await self.database_client.get_document(self.database_container, self.conversation_id)
+                # For existing conversations, determine the partition key
+                partition_key = f"anonymous-{self.conversation_id}" if self.principal_id == "anonymous" else self.principal_id
+                conversation = await self.database_client.get_document(
+                    self.database_container, 
+                    self.conversation_id,
+                    partition_key=partition_key
+                )
                 if conversation is None:
                     raise ValueError(f"Conversation {self.conversation_id} not found")
 
@@ -80,7 +95,10 @@ class Orchestrator:
                     yield chunk
             finally:
                 # 4) Persist whatever the strategy has updated (e.g. thread_id)
-                await self.database_client.update_document(self.database_container, self.agentic_strategy.conversation)
+                await self.database_client.update_document(
+                    self.database_container, 
+                    self.agentic_strategy.conversation
+                )
 
             logging.debug(f"Finished conversation {self.conversation_id}")
 
@@ -91,10 +109,14 @@ class Orchestrator:
         if not self.conversation_id:
             raise ValueError("Conversation ID is required to save feedback")
 
+        # For anonymous users, use anonymous-{conversation_id} as partition key; for authenticated, use principal_id
+        partition_key = f"anonymous-{self.conversation_id}" if self.principal_id == "anonymous" else self.principal_id
+
         # Retrieve existing conversation document
         conversation = await self.database_client.get_document(
             self.database_container,
-            self.conversation_id
+            self.conversation_id,
+            partition_key=partition_key
         )
         if conversation is None:
             raise ValueError(f"Conversation {self.conversation_id} not found in database")
@@ -132,5 +154,8 @@ class Orchestrator:
             conversation["feedback"] = []
         conversation["feedback"].append(feedback)
 
-        await self.database_client.update_document(self.database_container, conversation)
+        await self.database_client.update_document(
+            self.database_container, 
+            conversation
+        )
         logging.info(f"Feedback saved for conversation {self.conversation_id}")

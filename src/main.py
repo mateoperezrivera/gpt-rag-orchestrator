@@ -14,9 +14,15 @@ from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
 from orchestration.orchestrator import Orchestrator
 from connectors.appconfig import AppConfigClient
+from connectors.cosmosdb import (
+    query_user_conversations,
+    read_user_conversation,
+    update_conversation_name,
+    soft_delete_conversation,
+)
 from dependencies import get_config, validate_auth, validate_access_token, get_user_groups_from_graph
 from telemetry import Telemetry
-from schemas import OrchestratorRequest, ORCHESTRATOR_RESPONSES
+from schemas import OrchestratorRequest, ConversationListResponse, ConversationMetadata, ConversationDetail, ORCHESTRATOR_RESPONSES
 from constants import APPLICATION_INSIGHTS_CONNECTION_STRING, APP_NAME
 from util.tools import is_azure_environment
 
@@ -79,6 +85,85 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+# ----------------------------------------
+# Helper function for auth validation
+# ----------------------------------------
+async def validate_user_access(authorization: Optional[str], endpoint_name: str, require_auth: bool = False) -> str:
+    """
+    Validates user authorization and returns principal_id.
+    
+    Args:
+        authorization: Authorization header value (e.g., "Bearer <token>")
+        endpoint_name: Name of endpoint for logging (e.g., "[Orchestrator]")
+        require_auth: If True, endpoint requires authentication to be enabled and valid token
+    
+    Returns:
+        principal_id (OID) of the authenticated user, or "anonymous" if auth disabled and not required
+    
+    Raises:
+        HTTPException: If authorization fails, is invalid, or auth is required but disabled
+    """
+    enable_authentication = cfg.get("ENABLE_AUTHENTICATION", default=False, type=bool)
+    
+    if not enable_authentication:
+        if require_auth:
+            logging.warning(f"{endpoint_name} Authentication required but ENABLE_AUTHENTICATION is False")
+            raise HTTPException(status_code=401, detail="Authentication is required for this endpoint")
+        logging.debug(f"{endpoint_name} Authorization disabled, treating as anonymous")
+        return "anonymous"
+    
+    # Validate Authorization header
+    if not authorization or not authorization.startswith("Bearer "):
+        logging.warning(f"{endpoint_name} Missing or invalid Authorization header")
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    
+    access_token = authorization[7:]  # Remove "Bearer " prefix
+    logging.debug(f"{endpoint_name} Access token received, length: %d chars", len(access_token))
+    
+    try:
+        # Validate token and extract user info
+        user_info = await validate_access_token(access_token)
+        principal_id = user_info.get("oid")
+        
+        logging.debug(f"{endpoint_name} User info extracted: OID=%s, Username=%s, Name=%s", 
+                     principal_id, user_info.get("preferred_username"), user_info.get("name"))
+        
+        # Fetch user groups from Graph API
+        logging.debug(f"{endpoint_name} Fetching user groups from Graph API...")
+        groups = await get_user_groups_from_graph(principal_id)
+        
+        logging.debug(f"{endpoint_name} User groups: %s", groups)
+        
+        # Check authorization based on groups/principals
+        allowed_names = [n.strip() for n in cfg.get("ALLOWED_USER_NAMES", default="").split(",") if n.strip()]
+        allowed_ids = [id.strip() for id in cfg.get("ALLOWED_USER_PRINCIPALS", default="").split(",") if id.strip()]
+        allowed_groups = [g.strip() for g in cfg.get("ALLOWED_GROUP_NAMES", default="").split(",") if g.strip()]
+        
+        logging.debug(f"{endpoint_name} Authorization checks - Allowed names: %s, IDs: %s, Groups: %s", 
+                     allowed_names, allowed_ids, allowed_groups)
+        
+        is_authorized = (
+            not (allowed_names or allowed_ids or allowed_groups) or
+            user_info.get("preferred_username") in allowed_names or
+            principal_id in allowed_ids or
+            any(g in allowed_groups for g in groups)
+        )
+        
+        if not is_authorized:
+            logging.warning(f"{endpoint_name} ❌ Access denied for user %s (%s)", 
+                           principal_id, user_info.get("preferred_username"))
+            raise HTTPException(status_code=403, detail="You are not authorized to perform this action")
+        
+        logging.info(f"{endpoint_name} ✅ Authorization successful for user %s", user_info.get("preferred_username"))
+        return principal_id
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"{endpoint_name} Error validating user token: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
 @app.post(
     "/orchestrator",
     dependencies=[Depends(validate_auth)], 
@@ -102,75 +187,17 @@ async def orchestrator_endpoint(
 
     # Extract and validate user info from access token if authentication is enabled
     user_context = body.user_context or {}
-    enable_authentication = cfg.get("ENABLE_AUTHENTICATION", default=False, type=bool)
     
-    logging.debug("[Orchestrator] ENABLE_AUTHENTICATION: %s", enable_authentication)
+    principal_id = await validate_user_access(authorization, "[Orchestrator]")
+    user_context["principal_id"] = principal_id
     
-    if enable_authentication:
-        logging.debug("[Orchestrator] Authorization enabled, validating access token...")
-        
-        # Extract token from Authorization header (OAuth 2.0 RFC 6750)
-        if not authorization:
-            logging.warning("[Orchestrator] No Authorization header provided")
-            raise HTTPException(status_code=401, detail="Missing Authorization header")
-        
-        # Extract Bearer token from "Bearer <token>" format
-        if not authorization.startswith("Bearer "):
-            logging.warning("[Orchestrator] Invalid Authorization header format")
-            raise HTTPException(status_code=401, detail="Invalid Authorization header format")
-        
-        access_token = authorization[7:]  # Remove "Bearer " prefix
-        logging.debug("[Orchestrator] Access token received, length: %d chars", len(access_token))
-        
-        try:
-            # Validate token and extract user info
-            user_info = await validate_access_token(access_token)
-            user_context["principal_id"] = user_info.get("oid")
-            user_context["principal_name"] = user_info.get("preferred_username")
-            user_context["user_name"] = user_info.get("name")
-            
-            logging.debug("[Orchestrator] User info extracted: OID=%s, Username=%s, Name=%s", 
-                         user_info.get("oid"), user_info.get("preferred_username"), user_info.get("name"))
-            
-            # Fetch user groups from Graph API
-            logging.debug("[Orchestrator] Fetching user groups from Graph API...")
-            groups = await get_user_groups_from_graph(user_info.get("oid"))
-            user_context["groups"] = groups
-            
-            logging.debug("[Orchestrator] User groups: %s", groups)
-            
-            # Check authorization based on groups/principals
-            allowed_names = [n.strip() for n in cfg.get("ALLOWED_USER_NAMES", default="").split(",") if n.strip()]
-            allowed_ids = [id.strip() for id in cfg.get("ALLOWED_USER_PRINCIPALS", default="").split(",") if id.strip()]
-            allowed_groups = [g.strip() for g in cfg.get("ALLOWED_GROUP_NAMES", default="").split(",") if g.strip()]
-            
-            logging.debug("[Orchestrator] Authorization checks - Allowed names: %s, IDs: %s, Groups: %s", 
-                         allowed_names, allowed_ids, allowed_groups)
-            
-            is_authorized = (
-                not (allowed_names or allowed_ids or allowed_groups) or
-                user_info.get("preferred_username") in allowed_names or
-                user_info.get("oid") in allowed_ids or
-                any(g in allowed_groups for g in groups)
-            )
-            
-            if not is_authorized:
-                logging.warning("[Orchestrator] ❌ Access denied for user %s (%s)", 
-                               user_info.get("oid"), user_info.get("preferred_username"))
-                raise HTTPException(status_code=403, detail="You are not authorized to perform this action")
-            
-            logging.info("[Orchestrator] ✅ Authorization successful for user %s", user_info.get("preferred_username"))
-        except HTTPException:
-            raise
-        except Exception as e:
-            logging.error("[Orchestrator] Error validating user token: %s", e)
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-    else:
-        # No authorization required; treat as anonymous
-        logging.debug("[Orchestrator] Authorization disabled, treating as anonymous")
-        user_context["principal_id"] = "anonymous"
-        user_context["principal_name"] = "anonymous"
-        user_context["groups"] = []
+    if principal_id != "anonymous":
+        # Extract additional user info for non-anonymous users
+        access_token = authorization[7:]
+        user_info = await validate_access_token(access_token)
+        user_context["principal_name"] = user_info.get("preferred_username")
+        user_context["user_name"] = user_info.get("name")
+        user_context["groups"] = await get_user_groups_from_graph(principal_id)
 
     # Feedback submissions: allow missing ask/question; validate only what's required
     if op_type == "feedback":
@@ -181,7 +208,12 @@ async def orchestrator_endpoint(
             raise HTTPException(status_code=400, detail="No 'conversation_id' field in request body")
 
         # Create orchestrator instance and save feedback
-        orchestrator = await Orchestrator.create(conversation_id=conversation_id, user_context=user_context)
+        principal_id = user_context.get("principal_id", "anonymous")
+        orchestrator = await Orchestrator.create(
+            conversation_id=conversation_id, 
+            principal_id=principal_id,
+            user_context=user_context
+        )
         # Build feedback dict defensively; optional fields may be absent
         _qid = getattr(body, "question_id", None)
         feedback = {
@@ -200,8 +232,10 @@ async def orchestrator_endpoint(
     if not ask:
         raise HTTPException(status_code=400, detail="No 'ask' or 'question' field in request body")
 
+    principal_id = user_context.get("principal_id", "anonymous")
     orchestrator = await Orchestrator.create(
         conversation_id=body.conversation_id,
+        principal_id=principal_id,
         user_context=user_context
     )
 
@@ -218,6 +252,276 @@ async def orchestrator_endpoint(
         sse_event_generator(),
         media_type="text/event-stream"
     )
+
+
+@app.get(
+    "/conversations",
+    dependencies=[Depends(validate_auth)],
+    summary="List user conversations",
+    response_model=ConversationListResponse,
+    responses={
+        200: {"description": "OK — list of conversations"},
+        401: {"description": "Unauthorized — missing or invalid credentials"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def list_conversations(
+    skip: int = 0,
+    limit: int = 10,
+    name: Optional[str] = None,
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    dapr_api_token: Optional[str] = Header(None, alias="dapr-api-token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """
+    Retrieve paginated list of conversations for the authenticated user.
+    
+    Query parameters:
+    - skip: Number of conversations to skip (default: 0)
+    - limit: Maximum number of conversations to return (default: 10)
+    - name: Optional filter by conversation name (exact match)
+    
+    Returns metadata only (id, name, created_at, lastUpdated) without message content.
+    """
+    
+    principal_id = await validate_user_access(authorization, "[ListConversations]", require_auth=True)
+    
+    try:
+        conversation_docs = await query_user_conversations(
+            principal_id=principal_id,
+            skip=skip,
+            limit=limit,
+            name=name,
+        )
+        conversations = [
+            ConversationMetadata(
+                id=doc.get("id"),
+                name=doc.get("name"),
+                created_at=doc.get("_ts"),
+                last_updated=doc.get("lastUpdated"),
+            )
+            for doc in conversation_docs
+        ]
+
+        logging.debug(
+            "[ListConversations] User %s: retrieved %d conversations",
+            principal_id,
+            len(conversations),
+        )
+
+        has_more = len(conversations) == limit
+        return ConversationListResponse(
+            conversations=conversations,
+            has_more=has_more,
+            skip=skip,
+            limit=limit,
+        )
+
+    except Exception as e:
+        logging.error("[ListConversations] Error retrieving conversations: %s", e)
+        raise HTTPException(status_code=500, detail="Error retrieving conversations")
+
+
+@app.get(
+    "/conversations/{conversation_id}",
+    dependencies=[Depends(validate_auth)],
+    summary="Get specific conversation",
+    response_model=ConversationDetail,
+    responses={
+        200: {"description": "OK — full conversation detail"},
+        401: {"description": "Unauthorized — missing or invalid credentials"},
+        403: {"description": "Forbidden — not the owner of this conversation"},
+        404: {"description": "Not Found — conversation does not exist"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def get_conversation(
+    conversation_id: str,
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    dapr_api_token: Optional[str] = Header(None, alias="dapr-api-token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """
+    Retrieve full details of a specific conversation including all messages.
+    
+    Path parameters:
+    - conversation_id: The ID of the conversation to retrieve
+    
+    Returns the complete conversation document with all messages.
+    Verifies that the requester is the owner (principal_id matches).
+    """
+    
+    principal_id = await validate_user_access(authorization, "[GetConversation]", require_auth=True)
+    
+    try:
+        conversation_doc = await read_user_conversation(conversation_id, principal_id)
+        if conversation_doc is None:
+            logging.debug(
+                "[GetConversation] Conversation %s not found for user %s",
+                conversation_id,
+                principal_id,
+            )
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        if conversation_doc.get("principal_id") != principal_id:
+            logging.warning(
+                "[GetConversation] Access denied: user %s tried to access conversation %s",
+                principal_id,
+                conversation_id,
+            )
+            raise HTTPException(status_code=403, detail="You do not have permission to access this conversation")
+
+        logging.debug(
+            "[GetConversation] User %s retrieved conversation %s", principal_id, conversation_id
+        )
+
+        return ConversationDetail(
+            id=conversation_doc.get("id"),
+            name=conversation_doc.get("name"),
+            principal_id=conversation_doc.get("principal_id"),
+            created_at=conversation_doc.get("_ts"),
+            last_updated=conversation_doc.get("lastUpdated"),
+            messages=conversation_doc.get("messages", []),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("[GetConversation] Error retrieving conversation: %s", e)
+        raise HTTPException(status_code=500, detail="Error retrieving conversation")
+
+
+@app.patch(
+    "/conversations/{conversation_id}",
+    dependencies=[Depends(validate_auth)],
+    summary="Update conversation name",
+    responses={
+        200: {"description": "OK — conversation updated"},
+        401: {"description": "Unauthorized — missing or invalid credentials"},
+        403: {"description": "Forbidden — not the owner of this conversation"},
+        404: {"description": "Not Found — conversation does not exist or is deleted"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def update_conversation(
+    conversation_id: str,
+    body: dict,
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    dapr_api_token: Optional[str] = Header(None, alias="dapr-api-token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """
+    Update a conversation's name.
+    
+    Request body should contain:
+    - name: New conversation name
+    
+    Returns the updated conversation metadata.
+    Verifies that the requester is the owner (principal_id matches).
+    """
+    
+    principal_id = await validate_user_access(authorization, "[UpdateConversation]", require_auth=True)
+    
+    try:
+        # Validate that conversation exists and user owns it
+        conversation_doc = await read_user_conversation(conversation_id, principal_id)
+        if conversation_doc is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        if conversation_doc.get("principal_id") != principal_id:
+            logging.warning(
+                "[UpdateConversation] Access denied: user %s tried to update conversation %s",
+                principal_id,
+                conversation_id,
+            )
+            raise HTTPException(status_code=403, detail="You do not have permission to access this conversation")
+
+        # Extract new name from body
+        new_name = body.get("name", "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Conversation name cannot be empty")
+
+        # Update the conversation
+        updated_doc = await update_conversation_name(conversation_id, principal_id, new_name)
+        if updated_doc is None:
+            raise HTTPException(status_code=500, detail="Failed to update conversation")
+
+        logging.debug(
+            "[UpdateConversation] User %s updated conversation %s name", principal_id, conversation_id
+        )
+
+        return {
+            "id": updated_doc.get("id"),
+            "name": updated_doc.get("name"),
+            "lastUpdated": updated_doc.get("lastUpdated"),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("[UpdateConversation] Error updating conversation: %s", e)
+        raise HTTPException(status_code=500, detail="Error updating conversation")
+
+
+@app.delete(
+    "/conversations/{conversation_id}",
+    dependencies=[Depends(validate_auth)],
+    summary="Delete conversation",
+    responses={
+        200: {"description": "OK — conversation deleted"},
+        401: {"description": "Unauthorized — missing or invalid credentials"},
+        403: {"description": "Forbidden — not the owner of this conversation"},
+        404: {"description": "Not Found — conversation does not exist"},
+        500: {"description": "Internal Server Error"}
+    }
+)
+async def delete_conversation(
+    conversation_id: str,
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    dapr_api_token: Optional[str] = Header(None, alias="dapr-api-token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """
+    Soft delete a conversation (marks as deleted without removing data).
+    
+    The conversation will no longer appear in list endpoints and cannot be accessed or modified.
+    The data is retained for audit purposes.
+    
+    Verifies that the requester is the owner (principal_id matches).
+    """
+    
+    principal_id = await validate_user_access(authorization, "[DeleteConversation]", require_auth=True)
+    
+    try:
+        # Validate that conversation exists and user owns it
+        conversation_doc = await read_user_conversation(conversation_id, principal_id)
+        if conversation_doc is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        if conversation_doc.get("principal_id") != principal_id:
+            logging.warning(
+                "[DeleteConversation] Access denied: user %s tried to delete conversation %s",
+                principal_id,
+                conversation_id,
+            )
+            raise HTTPException(status_code=403, detail="You do not have permission to access this conversation")
+
+        # Soft delete the conversation
+        deleted_doc = await soft_delete_conversation(conversation_id, principal_id)
+        if deleted_doc is None:
+            raise HTTPException(status_code=500, detail="Failed to delete conversation")
+
+        logging.info(
+            "[DeleteConversation] User %s deleted conversation %s", principal_id, conversation_id
+        )
+
+        return {"status": "success", "message": "Conversation deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("[DeleteConversation] Error deleting conversation: %s", e)
+        raise HTTPException(status_code=500, detail="Error deleting conversation")
 
 # Instrumentation
 HTTPXClientInstrumentor().instrument()

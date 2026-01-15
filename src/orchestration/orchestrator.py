@@ -74,7 +74,20 @@ class Orchestrator:
                     partition_key=partition_key
                 )
                 if conversation is None:
-                    raise ValueError(f"Conversation {self.conversation_id} not found")
+                    logging.info(f"Conversation {self.conversation_id} not found; creating new conversation")
+                    default_name = ask[:50] if ask else "Untitled Conversation"
+                    conversation = {
+                        "id": self.conversation_id,
+                        "name": default_name,
+                        "principal_id": partition_key,
+                        "lastUpdated": datetime.now(timezone.utc).isoformat()
+                    }
+                    await self.database_client.create_document(
+                        self.database_container, 
+                        self.conversation_id, 
+                        conversation,
+                        partition_key=partition_key
+                    )
 
             # Optionally record the incoming question (id + text) for traceability
             if question_id:

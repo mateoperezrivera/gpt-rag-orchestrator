@@ -220,6 +220,9 @@ async def get_user_groups_from_graph(user_oid: str) -> List[str]:
                 headers=headers,
                 timeout=10
             )
+            if groups_response.status_code == 403:
+                logging.warning("[Auth] App lacks Graph API permissions (GroupMember.Read.All) to read user groups")
+                return []
             groups_response.raise_for_status()
             groups_data = groups_response.json()
         
